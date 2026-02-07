@@ -1,6 +1,7 @@
 bigbuckbunny.mp4
 bigbuckbunny_30s.mp4
 chunks.db
+chunks.db.gz
 chunks.db-wal
 chunks.db-shm
 verify_frame_*.yuv
