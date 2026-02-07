@@ -83,7 +83,8 @@ func ingest(dbPath string) error {
 		make([]byte, paddedW*paddedH),
 	}
 	chunkBuf := make([]byte, chunkSize*chunkSize)
-	dctBuf := make([]byte, chunkSize*chunkSize*2) // int16 coefficients (512 bytes for 16x16)
+	dctBuf := make([]byte, chunkSize*chunkSize*2)   // int16 coefficients (512 bytes for 16x16)
+	bpBuf := make([]byte, chunkSize*chunkSize*2)    // bit-plane reordered
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -99,7 +100,7 @@ func ingest(dbPath string) error {
 	frame := 0
 
 	findOrInsertBlock := func(frame, cx, cy int, planeName string) (int64, error) {
-		data := append([]byte(nil), dctBuf...)
+		data := append([]byte(nil), bpBuf...)
 
 		// INSERT OR IGNORE skips if data already exists (UNIQUE PK)
 		if _, err := stmts.insertBlock.Exec(data); err != nil {
@@ -160,6 +161,9 @@ func ingest(dbPath string) error {
 					// Extract DC coefficient (position [0,0]) and zero it
 					dcs[p] = int16(binary.LittleEndian.Uint16(dctBuf[0:2]))
 					binary.LittleEndian.PutUint16(dctBuf[0:2], 0)
+
+					// Reorder to bit planes (MSB first) for better run-length properties
+					toBitPlanes(bpBuf, dctBuf)
 
 					id, err := findOrInsertBlock(frame, cx, cy, planeNames[p])
 					if err != nil {
