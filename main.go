@@ -13,7 +13,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const chunkSize = 32
+const chunkSize = 16
 
 func main() {
 	if len(os.Args) < 2 {
@@ -83,7 +83,7 @@ func ingest(dbPath string) error {
 		make([]byte, paddedW*paddedH),
 	}
 	chunkBuf := make([]byte, chunkSize*chunkSize)
-	dctBuf := make([]byte, chunkSize*chunkSize*2) // int16 coefficients
+	dctBuf := make([]byte, chunkSize*chunkSize*2) // int16 coefficients (512 bytes for 16x16)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -155,7 +155,7 @@ func ingest(dbPath string) error {
 				var dcs [3]int16
 				for p := 0; p < 3; p++ {
 					extractChunk(chunkBuf, paddedPlanes[p], paddedW, cx, cy, chunkSize)
-					forwardDCT32(dctBuf, chunkBuf)
+					forwardDCT(dctBuf, chunkBuf)
 
 					// Extract DC coefficient (position [0,0]) and zero it
 					dcs[p] = int16(binary.LittleEndian.Uint16(dctBuf[0:2]))
