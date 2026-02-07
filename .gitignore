@@ -1,0 +1,8 @@
+bigbuckbunny.mp4
+chunks.db
+chunks.db-wal
+chunks.db-shm
+verify_frame_*.yuv
+verify_frame_*.png
+ingest
+video-codex
