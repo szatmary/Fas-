@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"io"
@@ -77,7 +76,11 @@ func ingest(dbPath string) error {
 	planeSize := width * height
 	framePixels := planeSize * 3 // YUV444: all planes same size
 	frameBuf := make([]byte, framePixels)
-	paddedPlane := make([]byte, paddedW*paddedH)
+	paddedPlanes := [3][]byte{
+		make([]byte, paddedW*paddedH),
+		make([]byte, paddedW*paddedH),
+		make([]byte, paddedW*paddedH),
+	}
 	chunkBuf := make([]byte, chunkSize*chunkSize)
 
 	tx, err := db.Begin()
@@ -89,12 +92,31 @@ func ingest(dbPath string) error {
 		return err
 	}
 
-	planeNames := []string{"Y", "U", "V"}
 	const batchSize = 10000
 	insertCount := 0
-	totalBlocks := 0
-	dedupBlocks := 0
 	frame := 0
+
+	findOrInsertBlock := func(frame, cx, cy int, planeName string) (int64, error) {
+		data := append([]byte(nil), chunkBuf...)
+
+		// INSERT OR IGNORE skips if data already exists (UNIQUE PK)
+		if _, err := stmts.insertBlock.Exec(data); err != nil {
+			return 0, fmt.Errorf("inserting block f=%d p=%s cx=%d cy=%d: %w", frame, planeName, cx, cy, err)
+		}
+
+		// Look up the rowid (works whether we just inserted or it already existed)
+		var rowID int64
+		if err := stmts.findBlock.QueryRow(data).Scan(&rowID); err != nil {
+			return 0, fmt.Errorf("finding block rowid: %w", err)
+		}
+
+		// Update ref_count
+		if _, err := stmts.incrRef.Exec(rowID); err != nil {
+			return 0, fmt.Errorf("incrementing ref_count: %w", err)
+		}
+
+		return rowID, nil
+	}
 
 	for {
 		// Each frame starts with "FRAME\n" (possibly with parameters after FRAME)
@@ -117,52 +139,42 @@ func ingest(dbPath string) error {
 			return fmt.Errorf("reading frame %d pixel data: %w", frame, err)
 		}
 
-		for p, planeName := range planeNames {
+		// Pad all three planes up front
+		for p := 0; p < 3; p++ {
 			planeData := frameBuf[p*planeSize : (p+1)*planeSize]
-			padPlane(paddedPlane, planeData, width, height, paddedW, paddedH)
+			padPlane(paddedPlanes[p], planeData, width, height, paddedW, paddedH)
+		}
 
-			for cy := 0; cy < chunksY; cy++ {
-				for cx := 0; cx < chunksX; cx++ {
-					extractChunk(chunkBuf, paddedPlane, paddedW, cx, cy, chunkSize)
+		planeNames := []string{"Y", "U", "V"}
 
-					h := sha256.Sum256(chunkBuf)
-					hash := h[:]
-
-					var blockID int64
-					err := stmts.findBlock.QueryRow(hash).Scan(&blockID)
-					if err == sql.ErrNoRows {
-						res, err := stmts.insertBlock.Exec(hash, append([]byte(nil), chunkBuf...))
-						if err != nil {
-							return fmt.Errorf("inserting block f=%d p=%s cx=%d cy=%d: %w", frame, planeName, cx, cy, err)
-						}
-						blockID, _ = res.LastInsertId()
-						totalBlocks++
-					} else if err != nil {
-						return fmt.Errorf("finding block: %w", err)
-					} else {
-						if _, err := stmts.incrRef.Exec(blockID); err != nil {
-							return fmt.Errorf("incrementing ref_count: %w", err)
-						}
-						dedupBlocks++
+		for cy := 0; cy < chunksY; cy++ {
+			for cx := 0; cx < chunksX; cx++ {
+				var blockIDs [3]int64
+				for p := 0; p < 3; p++ {
+					extractChunk(chunkBuf, paddedPlanes[p], paddedW, cx, cy, chunkSize)
+					id, err := findOrInsertBlock(frame, cx, cy, planeNames[p])
+					if err != nil {
+						return err
 					}
+					blockIDs[p] = id
+				}
 
-					if _, err := stmts.insertChunk.Exec(frame, planeName, cx, cy, blockID); err != nil {
-						return fmt.Errorf("inserting chunk f=%d p=%s cx=%d cy=%d: %w", frame, planeName, cx, cy, err)
+				if _, err := stmts.insertChunk.Exec(frame, cx, cy, blockIDs[0], blockIDs[1], blockIDs[2]); err != nil {
+					return fmt.Errorf("inserting chunk f=%d cx=%d cy=%d: %w", frame, cx, cy, err)
+				}
+
+				insertCount++
+				if insertCount%batchSize == 0 {
+					if err := tx.Commit(); err != nil {
+						return err
 					}
-
-					insertCount++
-					if insertCount%batchSize == 0 {
-						if err := tx.Commit(); err != nil {
-							return err
-						}
-						tx, err = db.Begin()
-						if err != nil {
-							return err
-						}
-						stmts, err = prepareStmts(tx)
-						if err != nil {
-							return err
-						}
+					tx, err = db.Begin()
+					if err != nil {
+						return err
+					}
+					stmts, err = prepareStmts(tx)
+					if err != nil {
+						return err
 					}
 				}
 			}
@@ -170,7 +182,7 @@ func ingest(dbPath string) error {
 
 		frame++
 		if frame%30 == 0 {
-			fmt.Printf("\rProcessed %d frames  (unique blocks: %d, duplicates: %d)", frame, totalBlocks, dedupBlocks)
+			fmt.Printf("\rProcessed %d frames (%d chunk rows)", frame, insertCount)
 		}
 	}
 
@@ -183,10 +195,12 @@ func ingest(dbPath string) error {
 		return err
 	}
 
-	fmt.Printf("\rProcessed %d frames  (unique blocks: %d, duplicates: %d)\n", frame, totalBlocks, dedupBlocks)
-	fmt.Printf("Total chunk references: %d\n", insertCount)
-	fmt.Printf("Unique blocks stored:   %d\n", totalBlocks)
-	fmt.Printf("Duplicate references:   %d\n", dedupBlocks)
+	var uniqueBlocks int
+	db.QueryRow("SELECT COUNT(*) FROM blocks").Scan(&uniqueBlocks)
+
+	fmt.Printf("\rProcessed %d frames\n", frame)
+	fmt.Printf("Total chunk rows:     %d\n", insertCount)
+	fmt.Printf("Unique blocks stored: %d\n", uniqueBlocks)
 
 	return nil
 }
@@ -243,19 +257,19 @@ type stmtSet struct {
 func prepareStmts(tx *sql.Tx) (stmtSet, error) {
 	var s stmtSet
 	var err error
-	s.insertBlock, err = tx.Prepare("INSERT INTO blocks (hash, data) VALUES (?, ?)")
+	s.insertBlock, err = tx.Prepare("INSERT OR IGNORE INTO blocks (data) VALUES (?)")
 	if err != nil {
 		return s, err
 	}
-	s.incrRef, err = tx.Prepare("UPDATE blocks SET ref_count = ref_count + 1 WHERE id = ?")
+	s.incrRef, err = tx.Prepare("UPDATE blocks SET ref_count = ref_count + 1 WHERE rowid = ?")
 	if err != nil {
 		return s, err
 	}
-	s.findBlock, err = tx.Prepare("SELECT id FROM blocks WHERE hash = ?")
+	s.findBlock, err = tx.Prepare("SELECT rowid FROM blocks WHERE data = ?")
 	if err != nil {
 		return s, err
 	}
-	s.insertChunk, err = tx.Prepare("INSERT INTO chunks (frame, plane, chunk_x, chunk_y, block_id) VALUES (?, ?, ?, ?, ?)")
+	s.insertChunk, err = tx.Prepare("INSERT INTO chunks (frame, chunk_x, chunk_y, block_y, block_u, block_v) VALUES (?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return s, err
 	}
@@ -270,19 +284,18 @@ func createSchema(db *sql.DB) error {
 		);
 
 		CREATE TABLE blocks (
-			id        INTEGER PRIMARY KEY AUTOINCREMENT,
-			hash      BLOB    NOT NULL UNIQUE,
-			data      BLOB    NOT NULL,
-			ref_count INTEGER NOT NULL DEFAULT 1
+			data      BLOB    NOT NULL PRIMARY KEY,
+			ref_count INTEGER NOT NULL DEFAULT 0
 		);
 
 		CREATE TABLE chunks (
 			frame    INTEGER NOT NULL,
-			plane    TEXT    NOT NULL CHECK(plane IN ('Y','U','V')),
 			chunk_x  INTEGER NOT NULL,
 			chunk_y  INTEGER NOT NULL,
-			block_id INTEGER NOT NULL REFERENCES blocks(id),
-			PRIMARY KEY (frame, plane, chunk_x, chunk_y)
+			block_y  INTEGER NOT NULL REFERENCES blocks(rowid),
+			block_u  INTEGER NOT NULL REFERENCES blocks(rowid),
+			block_v  INTEGER NOT NULL REFERENCES blocks(rowid),
+			PRIMARY KEY (frame, chunk_x, chunk_y)
 		);
 	`)
 	return err
