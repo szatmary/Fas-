@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -82,6 +83,7 @@ func ingest(dbPath string) error {
 		make([]byte, paddedW*paddedH),
 	}
 	chunkBuf := make([]byte, chunkSize*chunkSize)
+	dctBuf := make([]byte, chunkSize*chunkSize*2) // int16 coefficients
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -97,7 +99,7 @@ func ingest(dbPath string) error {
 	frame := 0
 
 	findOrInsertBlock := func(frame, cx, cy int, planeName string) (int64, error) {
-		data := append([]byte(nil), chunkBuf...)
+		data := append([]byte(nil), dctBuf...)
 
 		// INSERT OR IGNORE skips if data already exists (UNIQUE PK)
 		if _, err := stmts.insertBlock.Exec(data); err != nil {
@@ -150,8 +152,15 @@ func ingest(dbPath string) error {
 		for cy := 0; cy < chunksY; cy++ {
 			for cx := 0; cx < chunksX; cx++ {
 				var blockIDs [3]int64
+				var dcs [3]int16
 				for p := 0; p < 3; p++ {
 					extractChunk(chunkBuf, paddedPlanes[p], paddedW, cx, cy, chunkSize)
+					forwardDCT32(dctBuf, chunkBuf)
+
+					// Extract DC coefficient (position [0,0]) and zero it
+					dcs[p] = int16(binary.LittleEndian.Uint16(dctBuf[0:2]))
+					binary.LittleEndian.PutUint16(dctBuf[0:2], 0)
+
 					id, err := findOrInsertBlock(frame, cx, cy, planeNames[p])
 					if err != nil {
 						return err
@@ -159,7 +168,7 @@ func ingest(dbPath string) error {
 					blockIDs[p] = id
 				}
 
-				if _, err := stmts.insertChunk.Exec(frame, cx, cy, blockIDs[0], blockIDs[1], blockIDs[2]); err != nil {
+				if _, err := stmts.insertChunk.Exec(frame, cx, cy, dcs[0], dcs[1], dcs[2], blockIDs[0], blockIDs[1], blockIDs[2]); err != nil {
 					return fmt.Errorf("inserting chunk f=%d cx=%d cy=%d: %w", frame, cx, cy, err)
 				}
 
@@ -269,7 +278,7 @@ func prepareStmts(tx *sql.Tx) (stmtSet, error) {
 	if err != nil {
 		return s, err
 	}
-	s.insertChunk, err = tx.Prepare("INSERT INTO chunks (frame, chunk_x, chunk_y, block_y, block_u, block_v) VALUES (?, ?, ?, ?, ?, ?)")
+	s.insertChunk, err = tx.Prepare("INSERT INTO chunks (frame, chunk_x, chunk_y, dc_y, dc_u, dc_v, block_y, block_u, block_v) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return s, err
 	}
@@ -292,6 +301,9 @@ func createSchema(db *sql.DB) error {
 			frame    INTEGER NOT NULL,
 			chunk_x  INTEGER NOT NULL,
 			chunk_y  INTEGER NOT NULL,
+			dc_y     INTEGER NOT NULL,
+			dc_u     INTEGER NOT NULL,
+			dc_v     INTEGER NOT NULL,
 			block_y  INTEGER NOT NULL REFERENCES blocks(rowid),
 			block_u  INTEGER NOT NULL REFERENCES blocks(rowid),
 			block_v  INTEGER NOT NULL REFERENCES blocks(rowid),
